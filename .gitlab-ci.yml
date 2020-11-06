@@ -1,0 +1,85 @@
+variables:
+  REMOTE_HOST: deploy@wsp2
+  REMOTE_DIR: app
+  BACKEND_URL: http://wsp2pw-api.course.tamk.cloud
+
+stages:
+  - test
+  - build
+  - deploy
+test:
+  image: node:slim
+  stage: test
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - ./backend/node_modules
+      - ./frontend/node_modules
+
+  script:
+    - cd ./backend
+    - npm install
+    #- npm test
+    - cd .. && cd ./frontend
+    - npm install
+    - npm test
+
+build:
+  image: node:slim
+  stage: build
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - ./frontend/.next
+  dependencies:
+    - test
+  script:
+    - cd frontend
+    - npm run build
+
+deploy:
+  image: docker:latest
+  stage: deploy
+  services:
+    - docker:dind
+  dependencies:
+    - test
+    - build
+  script:
+    - export BACKEND_IMAGE="${CI_REGISTRY_IMAGE}/backend"
+    - export FRONTEND_IMAGE="${CI_REGISTRY_IMAGE}/frontend"
+    - apk update && apk add rsync openssh
+    - docker login -u gitlab-ci-token -p "${CI_JOB_TOKEN}" "${CI_REGISTRY}"
+    # Prepare SSH settings
+    - mkdir -p ~/.ssh && (umask  077 ; echo $DEPLOY_KEY_PRIVATE | base64 -d > ~/.ssh/id_rsa)
+    - echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
+    # Build containers
+    # - docker pull "${FRONTEND_IMAGE}"
+    # - docker pull "${BACKEND_IMAGE}"
+    - cd backend
+    - docker build -t "${BACKEND_IMAGE}" .
+    - cd ..
+    - cd frontend
+    - docker build -f DockerfileServer -t "${FRONTEND_IMAGE}" .
+    - cd ..
+    # Push to remote
+    - docker push "${BACKEND_IMAGE}"
+    - docker push "${FRONTEND_IMAGE}"
+    # Prepare files for transfer
+    - mkdir "${REMOTE_DIR}"
+    - cp docker-compose.server.yml "${REMOTE_DIR}/docker-compose.yml"
+    # Setup env
+    - echo "BACKEND_IMAGE=${BACKEND_IMAGE}" >> "${REMOTE_DIR}/.env"
+    - echo "FRONTEND_IMAGE=${FRONTEND_IMAGE}" >> "${REMOTE_DIR}/.env"
+    - echo "BACKEND_URL=${BACKEND_URL}" >> "${REMOTE_DIR}/.env"
+    # Copy files to server
+    - rsync -r "${REMOTE_DIR}" "${REMOTE_HOST}:./"
+    # Set up Docker environment on the remote server
+    - ssh ${REMOTE_HOST} /bin/bash "
+      echo ${REMOTE_DIR};
+      cd ~/$REMOTE_DIR;
+      docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY;
+      docker-compose pull;
+      docker-compose up -d --force-recreate;
+
+      "
